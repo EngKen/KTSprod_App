@@ -5,17 +5,23 @@
   "scripts": {
     "start": "node api-server.js",
     "build": "echo 'No build step required'",
-    "dev": "node api-server.js"
+    "dev": "nodemon api-server.js"
   },
   "keywords": ["pool-table", "transactions", "kentronics"],
   "author": "Kentronics Solutions",
   "license": "ISC",
   "description": "Pool Table Transactions Management System",
   "dependencies": {
+    "bcrypt": "^5.1.0",
     "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
     "express": "^5.1.0",
     "http-server": "^14.1.1",
-    "dotenv": "^16.0.3"
+    "jsonwebtoken": "^9.0.0",
+    "mysql2": "^3.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
   },
   "engines": {
     "node": ">=14.0.0"

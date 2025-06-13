@@ -2,14 +2,50 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('.'));
+
+// Database connection
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
+
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+
+// Authentication middleware
+const authenticateToken = async (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    try {
+        const user = jwt.verify(token, JWT_SECRET);
+        req.user = user;
+        next();
+    } catch (err) {
+        return res.status(403).json({ error: 'Invalid token' });
+    }
+};
 
 // Mock database - replace with real database in production
 const mockUsers = {
@@ -156,154 +192,311 @@ const mockWithdrawals = {
 // API Routes
 
 // Health check
-app.get('/wp-json/pooltable/v1/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        database: 'connected',
-        version: '2.0'
-    });
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Login endpoint
-app.post('/wp-json/pooltable/v1/login', (req, res) => {
-    const { accountId, password } = req.body;
-    
-    if (!accountId || !password) {
-        return res.status(400).json({
-            success: false,
-            message: 'Account ID and password are required'
-        });
-    }
-    
-    const user = mockUsers[accountId];
-    if (!user || user.password !== password) {
-        return res.status(401).json({
-            success: false,
-            message: 'Invalid credentials'
-        });
-    }
-    
-    const token = 'mock_token_' + Date.now();
-    
-    res.json({
-        success: true,
-        token: token,
-        user: {
-            id: user.device_id,
-            name: user.owner_name,
-            accountNumber: user.account_no,
-            phoneNumber: user.owner_number,
-            serialNumber: user.device_serial_number
+// Login
+app.post('/api/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const [users] = await pool.query(
+            'SELECT * FROM wp_users WHERE user_login = ?',
+            [username]
+        );
+
+        if (users.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials' });
         }
-    });
+
+        const user = users[0];
+        const validPassword = await bcrypt.compare(password, user.user_pass);
+
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+            { 
+                id: user.ID,
+                username: user.user_login,
+                email: user.user_email
+            },
+            JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        res.json({ token, user: { id: user.ID, username: user.user_login, email: user.user_email } });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get user data
+app.get('/api/users/:id', authenticateToken, async (req, res) => {
+    try {
+        const [users] = await pool.query(
+            'SELECT ID, user_login, user_email, display_name FROM wp_users WHERE ID = ?',
+            [req.params.id]
+        );
+
+        if (users.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.json(users[0]);
+    } catch (error) {
+        console.error('Get user error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 // Get user devices
-app.get('/wp-json/pooltable/v1/devices', (req, res) => {
-    const accountNo = req.query.account_no;
-    
-    if (!accountNo) {
-        return res.status(400).json({ error: 'Account number is required' });
+app.get('/api/devices', authenticateToken, async (req, res) => {
+    try {
+        const [devices] = await pool.query(
+            `SELECT d.*, 
+            (SELECT SUM(amount) FROM wp_device_transactions 
+             WHERE device_id = d.device_id) as balance
+            FROM wp_devices d 
+            WHERE account_no = ?`,
+            [req.user.id]
+        );
+
+        res.json(devices);
+    } catch (error) {
+        console.error('Get devices error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    const devices = mockDevices[accountNo] || [];
-    res.json(devices);
 });
 
-// Get transactions
-app.get('/wp-json/pooltable/v1/transactions', (req, res) => {
-    const accountNo = req.query.account_no;
-    
-    if (!accountNo) {
-        return res.status(400).json({ error: 'Account number is required' });
+// Get device balance
+app.get('/api/devices/:id/balance', authenticateToken, async (req, res) => {
+    try {
+        const [result] = await pool.query(
+            `SELECT SUM(amount) as balance 
+            FROM wp_device_transactions 
+            WHERE device_id = ?`,
+            [req.params.id]
+        );
+
+        res.json({ balance: result[0].balance || 0 });
+    } catch (error) {
+        console.error('Get balance error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    const transactions = mockTransactions[accountNo] || [];
-    // Sort by date descending (newest first)
-    transactions.sort((a, b) => new Date(b.transaction_date) - new Date(a.transaction_date));
-    
-    res.json(transactions);
 });
 
-// Get withdrawal history
-app.get('/wp-json/pooltable/v1/withdrawals', (req, res) => {
-    const accountNo = req.query.account_no;
-    
-    if (!accountNo) {
-        return res.status(400).json({ error: 'Account number is required' });
-    }
-    
-    const withdrawals = mockWithdrawals[accountNo] || [];
-    res.json(withdrawals);
-});
+// Get all transactions
+app.get('/api/transactions', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 20, start_date, end_date } = req.query;
+        const offset = (page - 1) * limit;
 
-// Get withdrawal details
-app.get('/wp-json/pooltable/v1/withdrawal-details', (req, res) => {
-    const accountNo = req.query.account_no;
-    
-    if (!accountNo) {
-        return res.status(400).json({ error: 'Account number is required' });
+        let query = `
+            SELECT t.*, d.device_name 
+            FROM wp_device_transactions t
+            LEFT JOIN wp_devices d ON t.device_id = d.device_id
+            WHERE t.account_no = ?
+        `;
+        const params = [req.user.id];
+
+        if (start_date && end_date) {
+            query += ' AND t.transaction_date BETWEEN ? AND ?';
+            params.push(start_date, end_date);
+        }
+
+        query += ' ORDER BY t.transaction_date DESC LIMIT ? OFFSET ?';
+        params.push(parseInt(limit), offset);
+
+        const [transactions] = await pool.query(query, params);
+        const [total] = await pool.query(
+            'SELECT COUNT(*) as count FROM wp_device_transactions WHERE account_no = ?',
+            [req.user.id]
+        );
+
+        res.json({
+            transactions,
+            pagination: {
+                total: total[0].count,
+                page: parseInt(page),
+                limit: parseInt(limit)
+            }
+        });
+    } catch (error) {
+        console.error('Get transactions error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    res.json({
-        payment_method: 'M-Pesa',
-        withdrawal_account: '+254701234567',
-        account_name: 'John Doe',
-        bank_name: null,
-        branch: null
-    });
 });
 
 // Process withdrawal
-app.post('/wp-json/pooltable/v1/withdraw', (req, res) => {
-    const { accountNo, amount, password } = req.body;
-    
-    if (!accountNo || !amount || !password) {
-        return res.status(400).json({
-            success: false,
-            message: 'Account number, amount, and password are required'
+app.post('/api/withdrawals', authenticateToken, async (req, res) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const { amount, withdrawal_account, account_name, payment_method = 'M-Pesa' } = req.body;
+        
+        // Generate transaction code
+        const transaction_code = 'W' + Date.now().toString().slice(-8);
+        
+        // Insert withdrawal request
+        const [result] = await connection.query(
+            `INSERT INTO wp_device_withdrawals 
+            (account_no, transaction_code, amount, withdrawal_account, account_name, payment_method)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+            [req.user.id, transaction_code, amount, withdrawal_account, account_name, payment_method]
+        );
+
+        await connection.commit();
+        
+        res.json({
+            message: 'Withdrawal request submitted successfully',
+            transaction_code,
+            withdrawal_id: result.insertId
         });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Withdrawal error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    } finally {
+        connection.release();
     }
-    
-    if (amount < 100) {
-        return res.status(400).json({
-            success: false,
-            message: 'Minimum withdrawal amount is KSH 100'
+});
+
+// Get withdrawal history
+app.get('/api/withdrawals', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 20, status } = req.query;
+        const offset = (page - 1) * limit;
+
+        let query = `
+            SELECT * FROM wp_device_withdrawals 
+            WHERE account_no = ?
+        `;
+        const params = [req.user.id];
+
+        if (status) {
+            query += ' AND status = ?';
+            params.push(status);
+        }
+
+        query += ' ORDER BY withdrawal_date DESC LIMIT ? OFFSET ?';
+        params.push(parseInt(limit), offset);
+
+        const [withdrawals] = await pool.query(query, params);
+        const [total] = await pool.query(
+            'SELECT COUNT(*) as count FROM wp_device_withdrawals WHERE account_no = ?',
+            [req.user.id]
+        );
+
+        res.json({
+            withdrawals,
+            pagination: {
+                total: total[0].count,
+                page: parseInt(page),
+                limit: parseInt(limit)
+            }
         });
+    } catch (error) {
+        console.error('Get withdrawals error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    // Mock successful withdrawal
-    const transactionCode = 'WD' + Date.now();
-    
-    res.json({
-        success: true,
-        message: 'Withdrawal request submitted successfully',
-        transaction_code: transactionCode,
-        amount: amount,
-        estimated_processing_time: '24 hours'
-    });
 });
 
 // Submit support ticket
-app.post('/wp-json/pooltable/v1/support', (req, res) => {
-    const { name, phone, category, subject, message } = req.body;
-    
-    if (!name || !phone || !category || !subject || !message) {
-        return res.status(400).json({
-            success: false,
-            message: 'All required fields must be filled'
+app.post('/api/support', authenticateToken, async (req, res) => {
+    try {
+        const {
+            name,
+            email,
+            phone,
+            category,
+            subject,
+            message,
+            priority = 'medium'
+        } = req.body;
+
+        const ticket_number = 'TKT' + Date.now().toString().slice(-8);
+
+        const [result] = await pool.query(
+            `INSERT INTO wp_support_tickets 
+            (ticket_number, account_no, name, email, phone, category, subject, message, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [ticket_number, req.user.id, name, email, phone, category, subject, message, priority]
+        );
+
+        res.json({
+            message: 'Support ticket submitted successfully',
+            ticket_number,
+            ticket_id: result.insertId
         });
+    } catch (error) {
+        console.error('Support ticket error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
-    
-    const ticketNumber = 'TKT' + Date.now();
-    
-    res.json({
-        success: true,
-        message: 'Support ticket submitted successfully',
-        ticket_number: ticketNumber,
-        estimated_response_time: '4 hours'
-    });
+});
+
+// Get support tickets
+app.get('/api/support', authenticateToken, async (req, res) => {
+    try {
+        const { page = 1, limit = 20, status } = req.query;
+        const offset = (page - 1) * limit;
+
+        let query = `
+            SELECT * FROM wp_support_tickets 
+            WHERE account_no = ?
+        `;
+        const params = [req.user.id];
+
+        if (status) {
+            query += ' AND status = ?';
+            params.push(status);
+        }
+
+        query += ' ORDER BY created_date DESC LIMIT ? OFFSET ?';
+        params.push(parseInt(limit), offset);
+
+        const [tickets] = await pool.query(query, params);
+        const [total] = await pool.query(
+            'SELECT COUNT(*) as count FROM wp_support_tickets WHERE account_no = ?',
+            [req.user.id]
+        );
+
+        res.json({
+            tickets,
+            pagination: {
+                total: total[0].count,
+                page: parseInt(page),
+                limit: parseInt(limit)
+            }
+        });
+    } catch (error) {
+        console.error('Get tickets error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get dashboard stats
+app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
+    try {
+        const [stats] = await pool.query(
+            `SELECT 
+                COUNT(DISTINCT device_id) as total_devices,
+                SUM(CASE WHEN game_status = 'played' THEN amount ELSE 0 END) as total_earnings,
+                COUNT(CASE WHEN game_status = 'played' THEN 1 END) as total_games,
+                (SELECT COUNT(*) FROM wp_device_withdrawals WHERE account_no = ? AND status = 'pending') as pending_withdrawals
+            FROM wp_device_transactions
+            WHERE account_no = ?`,
+            [req.user.id, req.user.id]
+        );
+
+        res.json(stats[0]);
+    } catch (error) {
+        console.error('Get stats error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 // Serve static files (HTML, CSS, JS)
@@ -312,5 +505,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Pool Table API Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
