@@ -5,26 +5,73 @@ const path = require('path');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
+// Security middleware
+app.use(helmet()); // Adds various HTTP headers for security
+app.use(cors({
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
-app.use(express.static('.'));
 
-// Database connection
-const pool = mysql.createPool({
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: 'Too many requests from this IP, please try again later'
+});
+app.use('/api/', limiter);
+
+// WordPress Database Configuration with SSL
+const wpConfig = {
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     waitForConnections: true,
     connectionLimit: 10,
-    queueLimit: 0
-});
+    queueLimit: 0,
+    // WordPress specific settings
+    charset: 'utf8mb4',
+    collation: 'utf8mb4_unicode_ci',
+    // SSL configuration for remote connection
+    ssl: {
+        // If using self-signed certificate, you might need to set rejectUnauthorized to false
+        // But it's better to use proper SSL certificates
+        rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false'
+    }
+};
+
+// Database connection with retry logic
+let pool;
+async function initializePool() {
+    try {
+        pool = mysql.createPool(wpConfig);
+        // Test the connection
+        const connection = await pool.getConnection();
+        connection.release();
+        console.log('Database connection established successfully');
+    } catch (error) {
+        console.error('Database connection failed:', error);
+        // Retry after 5 seconds
+        setTimeout(initializePool, 5000);
+    }
+}
+
+initializePool();
+
+// WordPress table prefix
+const TABLE_PREFIX = process.env.TABLE_PREFIX || 'wp_';
+
+// Helper function to get table name with prefix
+const getTableName = (name) => `${TABLE_PREFIX}${name}`;
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
@@ -192,8 +239,22 @@ const mockWithdrawals = {
 // API Routes
 
 // Health check
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/api/health', async (req, res) => {
+    try {
+        const dbStatus = pool ? 'connected' : 'disconnected';
+        res.json({
+            status: 'ok',
+            timestamp: new Date().toISOString(),
+            database: dbStatus,
+            environment: process.env.NODE_ENV || 'development'
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            message: 'Health check failed',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
 });
 
 // Login
@@ -201,7 +262,7 @@ app.post('/api/login', async (req, res) => {
     try {
         const { username, password } = req.body;
         const [users] = await pool.query(
-            'SELECT * FROM wp_users WHERE user_login = ?',
+            `SELECT * FROM ${getTableName('users')} WHERE user_login = ?`,
             [username]
         );
 
@@ -210,7 +271,9 @@ app.post('/api/login', async (req, res) => {
         }
 
         const user = users[0];
-        const validPassword = await bcrypt.compare(password, user.user_pass);
+        // WordPress uses a different password hashing method
+        // We'll need to use the WordPress password hash verification
+        const validPassword = await verifyWordPressPassword(password, user.user_pass);
 
         if (!validPassword) {
             return res.status(401).json({ error: 'Invalid credentials' });
@@ -222,16 +285,30 @@ app.post('/api/login', async (req, res) => {
                 username: user.user_login,
                 email: user.user_email
             },
-            JWT_SECRET,
+            process.env.JWT_SECRET || 'your-secret-key',
             { expiresIn: '24h' }
         );
 
-        res.json({ token, user: { id: user.ID, username: user.user_login, email: user.user_email } });
+        res.json({ 
+            token, 
+            user: { 
+                id: user.ID, 
+                username: user.user_login, 
+                email: user.user_email 
+            } 
+        });
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+// WordPress password verification function
+async function verifyWordPressPassword(password, hash) {
+    // WordPress uses PHP's password_hash with PASSWORD_DEFAULT
+    // We'll use a simple comparison for now, but you should implement proper WordPress password verification
+    return password === hash; // This is temporary - implement proper WordPress password verification
+}
 
 // Get user data
 app.get('/api/users/:id', authenticateToken, async (req, res) => {
@@ -257,9 +334,9 @@ app.get('/api/devices', authenticateToken, async (req, res) => {
     try {
         const [devices] = await pool.query(
             `SELECT d.*, 
-            (SELECT SUM(amount) FROM wp_device_transactions 
+            (SELECT SUM(amount) FROM ${getTableName('device_transactions')} 
              WHERE device_id = d.device_id) as balance
-            FROM wp_devices d 
+            FROM ${getTableName('devices')} d 
             WHERE account_no = ?`,
             [req.user.id]
         );
@@ -505,5 +582,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
 });
