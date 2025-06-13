@@ -1,17 +1,23 @@
 {
-  "name": "workspace",
+  "name": "kts-pool-table-app",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "api-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node api-server.js",
+    "build": "echo 'No build step required'",
+    "dev": "node api-server.js"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["pool-table", "transactions", "kentronics"],
+  "author": "Kentronics Solutions",
   "license": "ISC",
-  "description": "",
+  "description": "Pool Table Transactions Management System",
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^5.1.0",
-    "http-server": "^14.1.1"
+    "http-server": "^14.1.1",
+    "dotenv": "^16.0.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
